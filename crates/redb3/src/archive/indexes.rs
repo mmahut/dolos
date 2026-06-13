@@ -736,7 +736,14 @@ impl Indexes {
         rx: &ReadTransaction,
         wx: &WriteTransaction,
     ) -> Result<(), Error> {
-        let source = rx.open_table(table)?;
+        // Index tables are created lazily on first write, so an early/small
+        // chain may not have one yet. A missing source table just means there
+        // are no entries to copy — skip it rather than failing the rebuild.
+        let source = match rx.open_table(table) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
         let mut target = wx.open_table(table)?;
 
         for entry in source.iter()? {
@@ -752,7 +759,12 @@ impl Indexes {
         rx: &ReadTransaction,
         wx: &WriteTransaction,
     ) -> Result<(), Error> {
-        let source = rx.open_multimap_table(table)?;
+        // See copy_value_table: tolerate a not-yet-created source table.
+        let source = match rx.open_multimap_table(table) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
         let mut target = wx.open_multimap_table(table)?;
 
         let all = source.range::<BucketedKey<u64>>(..)?;
