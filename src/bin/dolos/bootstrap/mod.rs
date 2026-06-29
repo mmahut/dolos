@@ -10,12 +10,14 @@ mod mithril;
 mod ranged;
 mod relay;
 mod snapshot;
+mod tee;
 
 #[derive(Debug, Subcommand, Clone)]
 pub enum Command {
     Relay(relay::Args),
     Mithril(mithril::Args),
     Snapshot(snapshot::Args),
+    Tee(tee::Args),
 }
 
 impl Command {
@@ -24,8 +26,9 @@ impl Command {
             "which bootstrap method would you like to use?",
             vec![
                 ListOption::new(0, "Dolos snapshot (a few mins, trust me bro)"),
-                ListOption::new(1, "Mithril snapshot (a few hours, trust Mithril SPOs)"),
-                ListOption::new(2, "Relay chain-sync (several days, trust your relay)"),
+                ListOption::new(1, "DISCo snapshot (a few mins, TEE me bro)"),
+                ListOption::new(2, "Mithril snapshot (a few hours, trust Mithril SPOs)"),
+                ListOption::new(3, "Relay chain-sync (several days, trust your relay)"),
             ],
         )
         .prompt()
@@ -33,8 +36,9 @@ impl Command {
 
         match cmd.index {
             0 => Ok(Command::Snapshot(snapshot::Args::inquire()?)),
-            1 => Ok(Command::Mithril(mithril::Args::default())),
-            2 => Ok(Command::Relay(relay::Args::default())),
+            1 => Ok(Command::Tee(tee::Args)),
+            2 => Ok(Command::Mithril(mithril::Args::default())),
+            3 => Ok(Command::Relay(relay::Args::default())),
             _ => unreachable!(),
         }
     }
@@ -114,11 +118,17 @@ fn handle_existing_data(config: &RootConfig, args: &Args) -> miette::Result<bool
     bail!("existing data detected in storage. Use --force to clear and re-bootstrap, --skip-if-data to skip, or --continue to resume");
 }
 
-fn dispatch(config: &RootConfig, command: &Command, feedback: &Feedback) -> miette::Result<()> {
+fn dispatch(
+    config: &RootConfig,
+    command: &Command,
+    feedback: &Feedback,
+    verbose: bool,
+) -> miette::Result<()> {
     match command {
         Command::Relay(args) => relay::run(config, args, feedback),
         Command::Mithril(args) => mithril::run(config, args, feedback),
-        Command::Snapshot(args) => snapshot::run(config, args, feedback),
+        Command::Snapshot(args) => snapshot::run(config, args, feedback, verbose),
+        Command::Tee(args) => tee::run(config, args, feedback, verbose),
     }
 }
 
@@ -179,7 +189,7 @@ pub fn run(config: &RootConfig, args: &Args, feedback: &Feedback) -> miette::Res
         None => Command::inquire()?,
     };
 
-    dispatch(config, &command, feedback)?;
+    dispatch(config, &command, feedback, args.verbose)?;
 
     // Reset WAL after any successful bootstrap so that `find_intersect` works.
     // Some bootstrap mechanisms skip WAL commits for performance, leaving it empty

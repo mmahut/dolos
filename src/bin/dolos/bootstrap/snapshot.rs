@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use dolos_core::config::RootConfig;
 use flate2::read::GzDecoder;
 use inquire::list_option::ListOption;
-use miette::{Context, IntoDiagnostic};
+use miette::{bail, Context, IntoDiagnostic};
 use tar::Archive;
 
 use super::ranged;
@@ -22,6 +22,10 @@ pub struct Args {
     /// Path to a local snapshot tar.gz file to import instead of downloading.
     #[arg(long)]
     pub file: Option<PathBuf>,
+
+    /// Verify and import a DISCo TEE-attested full snapshot.
+    #[arg(long)]
+    pub tee: bool,
 }
 
 impl Args {
@@ -46,6 +50,7 @@ impl Args {
             variant,
             point: "latest".to_string(),
             file: None,
+            tee: false,
         })
     }
 }
@@ -215,7 +220,28 @@ fn fetch_snapshot_streaming(
     Ok(())
 }
 
-pub fn run(config: &RootConfig, args: &Args, feedback: &Feedback) -> miette::Result<()> {
+pub fn run(
+    config: &RootConfig,
+    args: &Args,
+    feedback: &Feedback,
+    verbose: bool,
+) -> miette::Result<()> {
+    if args.tee {
+        if args.variant == "ledger" {
+            bail!("--tee is only available for full snapshots; remove --variant ledger");
+        }
+
+        if args.file.is_some() {
+            bail!("--tee cannot be used with --file");
+        }
+
+        if args.point != "latest" {
+            bail!("--tee currently supports only --point latest");
+        }
+
+        return super::tee::run(config, &super::tee::Args, feedback, verbose);
+    }
+
     if let Some(path) = &args.file {
         import_local_snapshot(config, path)?;
     } else {
