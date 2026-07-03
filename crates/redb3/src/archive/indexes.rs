@@ -736,7 +736,13 @@ impl Indexes {
         rx: &ReadTransaction,
         wx: &WriteTransaction,
     ) -> Result<(), Error> {
-        let source = rx.open_table(table)?;
+        // Source table may not exist on an early/sparse archive (e.g. no native
+        // assets/certs/scripts yet) — nothing to copy.
+        let source = match rx.open_table(table) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
         let mut target = wx.open_table(table)?;
 
         for entry in source.iter()? {
@@ -752,7 +758,11 @@ impl Indexes {
         rx: &ReadTransaction,
         wx: &WriteTransaction,
     ) -> Result<(), Error> {
-        let source = rx.open_multimap_table(table)?;
+        let source = match rx.open_multimap_table(table) {
+            Ok(t) => t,
+            Err(::redb::TableError::TableDoesNotExist(_)) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
         let mut target = wx.open_multimap_table(table)?;
 
         let all = source.range::<BucketedKey<u64>>(..)?;

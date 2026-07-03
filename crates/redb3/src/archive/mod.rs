@@ -796,7 +796,12 @@ impl ArchiveStore {
         for (_, table) in sorted {
             match table {
                 Table::Value(def) => {
-                    let src_t = src_rx.open_table(*def)?;
+                    // May not exist on an early/sparse archive — skip (empty).
+                    let src_t = match src_rx.open_table(*def) {
+                        Ok(t) => t,
+                        Err(::redb::TableError::TableDoesNotExist(_)) => continue,
+                        Err(e) => return Err(e.into()),
+                    };
                     let mut dst_t = dst_wx.open_table(*def)?;
                     for entry in src_t.range::<&[u8]>(..)? {
                         let (k, v) = entry?;
@@ -804,7 +809,11 @@ impl ArchiveStore {
                     }
                 }
                 Table::MultiValue(def) => {
-                    let src_t = src_rx.open_multimap_table(*def)?;
+                    let src_t = match src_rx.open_multimap_table(*def) {
+                        Ok(t) => t,
+                        Err(::redb::TableError::TableDoesNotExist(_)) => continue,
+                        Err(e) => return Err(e.into()),
+                    };
                     let mut dst_t = dst_wx.open_multimap_table(*def)?;
                     for entry in src_t.iter()? {
                         let (k, vals) = entry?;
