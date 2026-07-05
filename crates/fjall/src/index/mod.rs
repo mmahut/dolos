@@ -242,22 +242,30 @@ impl IndexStore {
         let fresh_block_tags =
             fresh_db.keyspace(keyspace_names::BLOCK_TAGS, KeyspaceCreateOptions::default)?;
 
+        // Copy in bounded chunks. A single batch buffers the entire store in
+        // memory until commit and OOMs on large stores (e.g. mainnet indexes);
+        // flushing every FLUSH_ROWS keeps peak memory flat regardless of store
+        // size. The major_compact below still produces canonical, fully-packed
+        // SSTables, so chunking does not change the output.
+        const FLUSH_ROWS: usize = 100_000;
         let mut batch = fresh_db.batch();
-        for guard in snapshot.iter(&self.cursor) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_cursor, k.as_ref(), v.as_ref());
-        }
-        for guard in snapshot.iter(&self.exact) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_exact, k.as_ref(), v.as_ref());
-        }
-        for guard in snapshot.iter(&self.utxo_tags) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_utxo_tags, k.as_ref(), v.as_ref());
-        }
-        for guard in snapshot.iter(&self.block_tags) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_block_tags, k.as_ref(), v.as_ref());
+        let mut pending = 0usize;
+        for (src, dst) in [
+            (&self.cursor, &fresh_cursor),
+            (&self.exact, &fresh_exact),
+            (&self.utxo_tags, &fresh_utxo_tags),
+            (&self.block_tags, &fresh_block_tags),
+        ] {
+            for guard in snapshot.iter(src) {
+                let (k, v) = guard.into_inner()?;
+                batch.insert(dst, k.as_ref(), v.as_ref());
+                pending += 1;
+                if pending >= FLUSH_ROWS {
+                    batch.commit()?;
+                    batch = fresh_db.batch();
+                    pending = 0;
+                }
+            }
         }
         batch.commit()?;
 

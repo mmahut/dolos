@@ -208,18 +208,29 @@ impl StateStore {
         let fresh_entities =
             fresh_db.keyspace(keyspace_names::ENTITIES, KeyspaceCreateOptions::default)?;
 
+        // Copy in bounded chunks. A single batch buffers the entire store in
+        // memory until commit and OOMs on large stores (e.g. mainnet state);
+        // flushing every FLUSH_ROWS keeps peak memory flat regardless of store
+        // size. The major_compact below still produces canonical, fully-packed
+        // SSTables, so chunking does not change the output.
+        const FLUSH_ROWS: usize = 100_000;
         let mut batch = fresh_db.batch();
-        for guard in snapshot.iter(&self.cursor) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_cursor, k.as_ref(), v.as_ref());
-        }
-        for guard in snapshot.iter(&self.utxos) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_utxos, k.as_ref(), v.as_ref());
-        }
-        for guard in snapshot.iter(&self.entities) {
-            let (k, v) = guard.into_inner()?;
-            batch.insert(&fresh_entities, k.as_ref(), v.as_ref());
+        let mut pending = 0usize;
+        for (src, dst) in [
+            (&self.cursor, &fresh_cursor),
+            (&self.utxos, &fresh_utxos),
+            (&self.entities, &fresh_entities),
+        ] {
+            for guard in snapshot.iter(src) {
+                let (k, v) = guard.into_inner()?;
+                batch.insert(dst, k.as_ref(), v.as_ref());
+                pending += 1;
+                if pending >= FLUSH_ROWS {
+                    batch.commit()?;
+                    batch = fresh_db.batch();
+                    pending = 0;
+                }
+            }
         }
         batch.commit()?;
 

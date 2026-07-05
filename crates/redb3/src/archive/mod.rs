@@ -775,7 +775,13 @@ impl ArchiveStore {
         &self,
         dest_index_path: impl AsRef<Path>,
     ) -> Result<(), RedbArchiveError> {
-        let mut fresh = Database::builder().create(dest_index_path.as_ref())?;
+        // Cap the write cache so the rebuild's peak memory stays bounded on
+        // large archives (matches the live archive's budget). redb writes
+        // through to the file as the cache fills rather than buffering the whole
+        // index in RAM, which is what OOMs mainnet-sized rebuilds.
+        let mut fresh = Database::builder()
+            .set_cache_size(1024 * 1024 * DEFAULT_CACHE_SIZE_MB)
+            .create(dest_index_path.as_ref())?;
 
         let src_rx = self.db().begin_read()?;
         let dst_wx = fresh.begin_write()?;
