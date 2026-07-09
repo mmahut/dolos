@@ -26,6 +26,17 @@ const SNP_SIGNED_LEN: usize = 0x2A0;
 
 const AMD_KDS: &str = "https://kds.amd.com/vcek/v1";
 
+// Intel TDX DCAP quote field offsets (dstack / Phala). Quote = 48B header +
+// 584B TD-report body + signature section. The PCK cert chain is embedded in
+// the quote, so TDX verification needs no network (unlike AMD's VCEK/KDS).
+const TDX_SIGNED_LEN: usize = 632; // header + TD-report body — the AK signs this
+const TDX_MRTD_OFFSET: usize = 184; // build-time TD measurement (48B)
+const TDX_RTMR0_OFFSET: usize = 376; // RTMR0..3, 48B each
+const TDX_RTMR_LEN: usize = 48;
+const TDX_REPORTDATA_OFFSET: usize = 568; // user report_data (64B)
+const SGX_REPORT_DATA_OFFSET: usize = 320; // within the 384B QE (SGX) report body
+const INTEL_SGX_ROOT_CN: &str = "Intel SGX Root CA";
+
 #[derive(Debug, clap::Args, Default, Clone)]
 pub struct Args;
 
@@ -54,7 +65,10 @@ struct Manifest {
 
 #[derive(Deserialize)]
 struct AttestationJson {
+    /// AMD SEV-SNP report (hex).
     report: Option<String>,
+    /// Intel TDX DCAP quote (hex), from dstack / Phala.
+    quote: Option<String>,
 }
 
 fn network_name(config: &RootConfig) -> &'static str {
@@ -410,6 +424,203 @@ fn verify_vcek_chain(
     })
 }
 
+// ── Intel TDX (dstack / Phala) ──────────────────────────────────────────────
+
+struct TdxVerifyResult {
+    mrtd: String,
+    rtmrs: [String; 4],
+}
+
+fn le_u16(b: &[u8], off: usize) -> usize {
+    u16::from_le_bytes([b[off], b[off + 1]]) as usize
+}
+
+fn le_u32(b: &[u8], off: usize) -> usize {
+    u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]]) as usize
+}
+
+// ECDSA P-256 verify over SHA-256(msg). pub_xy = 64B (x||y), sig_rs = 64B (r||s).
+fn p256_verify(pub_xy: &[u8], sig_rs: &[u8], msg: &[u8]) -> miette::Result<()> {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&pub_xy[..64]);
+    let key = VerifyingKey::from_sec1_bytes(&sec1)
+        .into_diagnostic()
+        .context("parsing P-256 public key")?;
+    let sig = Signature::from_slice(&sig_rs[..64])
+        .into_diagnostic()
+        .context("parsing P-256 signature")?;
+    key.verify(msg, &sig)
+        .into_diagnostic()
+        .context("P-256 signature invalid")
+}
+
+// Verify the Intel TDX DCAP quote signature chain (self-contained — the PCK
+// cert chain is embedded in the quote):
+//   1. attestation key (AK) signed the quote header + TD-report body
+//   2. QE report binds the AK  (report_data == SHA256(AK_pub || QE_auth))
+//   3. PCK leaf cert signed the QE report
+//   4. PCK chain verifies up to the Intel SGX Root CA
+// TODO: TCB-status check against Intel PCS + pin the Intel SGX Root CA fingerprint.
+fn verify_tdx_quote(raw: &[u8]) -> miette::Result<TdxVerifyResult> {
+    use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
+    use x509_cert::der::{DecodePem, Encode};
+    use x509_cert::Certificate;
+
+    if raw.len() < TDX_SIGNED_LEN + 4 + 128 {
+        bail!(
+            "TDX quote too short for signature section: {} bytes",
+            raw.len()
+        );
+    }
+
+    // signature section (all little-endian sizes)
+    let mut off = TDX_SIGNED_LEN;
+    let _sig_len = le_u32(raw, off);
+    off += 4;
+    let ak_sig = &raw[off..off + 64];
+    off += 64;
+    let ak_pub = &raw[off..off + 64];
+    off += 64;
+    let _cert_key_type = le_u16(raw, off);
+    off += 2;
+    let _cert_size = le_u32(raw, off);
+    off += 4;
+    let qe_report = &raw[off..off + 384];
+    off += 384;
+    let qe_report_sig = &raw[off..off + 64];
+    off += 64;
+    let qe_auth_size = le_u16(raw, off);
+    off += 2;
+    if off + qe_auth_size + 6 > raw.len() {
+        bail!("TDX quote QE-auth section out of bounds");
+    }
+    let qe_auth = &raw[off..off + qe_auth_size];
+    off += qe_auth_size;
+    let _pck_type = le_u16(raw, off);
+    off += 2;
+    let pck_size = le_u32(raw, off);
+    off += 4;
+    if off + pck_size > raw.len() {
+        bail!("TDX quote PCK section out of bounds");
+    }
+    let pck_pem = &raw[off..off + pck_size];
+
+    // 1. AK signed the quote header + TD-report body
+    p256_verify(ak_pub, ak_sig, &raw[..TDX_SIGNED_LEN])
+        .context("attestation-key signature over quote body invalid")?;
+
+    // 2. QE report binds the AK
+    let qe_report_data = &qe_report[SGX_REPORT_DATA_OFFSET..SGX_REPORT_DATA_OFFSET + 64];
+    let mut h = Sha256::new();
+    h.update(ak_pub);
+    h.update(qe_auth);
+    if h.finalize().as_slice() != &qe_report_data[..32] {
+        bail!("QE report does not bind the attestation key");
+    }
+
+    // parse the embedded PCK cert chain
+    let chain_str = String::from_utf8_lossy(pck_pem);
+    let certs: Vec<Certificate> = chain_str
+        .split("-----END CERTIFICATE-----")
+        .filter(|s| s.contains("-----BEGIN CERTIFICATE-----"))
+        .filter_map(|s| {
+            let full = format!("{}\n-----END CERTIFICATE-----", s.trim());
+            Certificate::from_pem(full.as_bytes()).ok()
+        })
+        .collect();
+    if certs.len() < 2 {
+        bail!("expected PCK cert chain, got {} cert(s)", certs.len());
+    }
+
+    let spki_xy = |c: &Certificate| -> Vec<u8> {
+        let spki = c
+            .tbs_certificate
+            .subject_public_key_info
+            .subject_public_key
+            .raw_bytes()
+            .to_vec();
+        // SEC1 uncompressed point is 0x04 || x || y (65B); strip the prefix.
+        if spki.len() == 65 && spki[0] == 0x04 {
+            spki[1..].to_vec()
+        } else {
+            spki
+        }
+    };
+
+    // 3. PCK leaf signed the QE report
+    p256_verify(&spki_xy(&certs[0]), qe_report_sig, qe_report)
+        .context("PCK leaf did not sign the QE report")?;
+
+    // 4. chain verifies to a self-signed Intel SGX Root CA
+    let root = certs
+        .iter()
+        .find(|c| c.tbs_certificate.issuer == c.tbs_certificate.subject)
+        .ok_or_else(|| miette::miette!("self-signed root not found in embedded PCK chain"))?;
+    let root_subject = format!("{}", root.tbs_certificate.subject);
+    if !root_subject.contains(INTEL_SGX_ROOT_CN) {
+        bail!("embedded root is not the Intel SGX Root CA: {}", root_subject);
+    }
+    for cert in &certs {
+        let issuer = match certs
+            .iter()
+            .find(|c| c.tbs_certificate.subject == cert.tbs_certificate.issuer)
+        {
+            Some(i) => i,
+            None => continue,
+        };
+        let mut sec1 = Vec::with_capacity(65);
+        sec1.push(0x04);
+        sec1.extend_from_slice(&spki_xy(issuer)[..64]);
+        let key = VerifyingKey::from_sec1_bytes(&sec1)
+            .into_diagnostic()
+            .context("parsing issuer P-256 key")?;
+        let tbs = cert.tbs_certificate.to_der().into_diagnostic()?;
+        let sig = Signature::from_der(cert.signature.raw_bytes())
+            .into_diagnostic()
+            .context("parsing cert signature")?;
+        key.verify(&tbs, &sig)
+            .into_diagnostic()
+            .with_context(|| format!("PCK chain broken at {}", cert.tbs_certificate.subject))?;
+    }
+
+    let rtmrs = [
+        hex::encode(&raw[TDX_RTMR0_OFFSET..TDX_RTMR0_OFFSET + TDX_RTMR_LEN]),
+        hex::encode(&raw[TDX_RTMR0_OFFSET + TDX_RTMR_LEN..TDX_RTMR0_OFFSET + 2 * TDX_RTMR_LEN]),
+        hex::encode(&raw[TDX_RTMR0_OFFSET + 2 * TDX_RTMR_LEN..TDX_RTMR0_OFFSET + 3 * TDX_RTMR_LEN]),
+        hex::encode(&raw[TDX_RTMR0_OFFSET + 3 * TDX_RTMR_LEN..TDX_RTMR0_OFFSET + 4 * TDX_RTMR_LEN]),
+    ];
+    Ok(TdxVerifyResult {
+        mrtd: hex::encode(&raw[TDX_MRTD_OFFSET..TDX_MRTD_OFFSET + 48]),
+        rtmrs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real dstack/Phala TDX quote from the disco preview epoch-1346 snapshot.
+    // Validates the full DCAP chain (AK sig → QE binding → PCK leaf → Intel SGX
+    // Root CA) and MRTD extraction against known-good values (matches disco-cli).
+    #[test]
+    fn tdx_quote_verifies() {
+        let att: AttestationJson =
+            serde_json::from_str(include_str!("testdata/preview-1346.attestation.json")).unwrap();
+        let quote_hex = att.quote.expect("attestation should carry a TDX quote");
+        let quote_hex = quote_hex.strip_prefix("0x").unwrap_or(&quote_hex);
+        let raw = hex::decode(quote_hex).expect("valid hex quote");
+
+        let res = verify_tdx_quote(&raw).expect("Intel TDX DCAP chain must verify");
+        assert_eq!(
+            res.mrtd,
+            "f06dfda6dce1cf904d4e2bab1dc370634cf95cefa2ceb2de2eee127c9382698090d7a4a13e14c536ec6c9c3c8fa87077",
+            "MRTD must match the known reproducible disco image measurement"
+        );
+    }
+}
+
 pub fn run(
     config: &RootConfig,
     _args: &Args,
@@ -534,58 +745,84 @@ pub fn run(
         eprintln!("  index_sha256    ✓  {}", index_hash);
     }
 
-    // 5. verify TEE attestation
+    // 5. verify TEE attestation. Dispatch on format: Intel TDX quote (dstack /
+    // Phala) or AMD SEV-SNP report. Both bind REPORT_DATA[:32] = SHA256(content).
     eprintln!("verifying TEE attestation …");
     let attest_bytes = http_get_bytes(&client, &attest_url)?;
     let attest: AttestationJson = serde_json::from_slice(&attest_bytes)
         .into_diagnostic()
         .context("parsing attestation JSON")?;
 
-    let report_hex = attest
-        .report
-        .ok_or_else(|| miette::miette!("no 'report' field in attestation JSON"))?;
-    let raw = hex::decode(&report_hex)
-        .into_diagnostic()
-        .context("decoding SNP report hex")?;
-
-    if raw.len() < SNP_SIGNATURE_OFFSET + 144 {
-        bail!("SNP report too short: {} bytes", raw.len());
-    }
-
-    let report = SnpReport(&raw);
-
-    // REPORT_DATA[:32] == SHA256(content_sha256_ascii)
     let expected_rd = Sha256::digest(content_hash.as_bytes());
-    let actual_rd = &report.report_data()[..32];
-    if actual_rd != expected_rd.as_slice() {
-        bail!(
-            "REPORT_DATA mismatch!\n  expected: {}\n  got:      {}",
-            hex::encode(expected_rd),
-            hex::encode(actual_rd)
-        );
-    }
+    let tee_summary: String;
 
-    if verbose {
-        eprintln!("  REPORT_DATA[:32] ✓  {}", hex::encode(actual_rd));
+    if let Some(quote_hex) = attest.quote.as_deref() {
+        // Intel TDX (dstack / Phala) — DCAP chain is embedded, no network needed.
+        let q = quote_hex.strip_prefix("0x").unwrap_or(quote_hex);
+        let raw = hex::decode(q)
+            .into_diagnostic()
+            .context("decoding TDX quote hex")?;
+        if raw.len() < TDX_REPORTDATA_OFFSET + 64 {
+            bail!("TDX quote too short: {} bytes", raw.len());
+        }
+        let actual_rd = &raw[TDX_REPORTDATA_OFFSET..TDX_REPORTDATA_OFFSET + 32];
+        if actual_rd != expected_rd.as_slice() {
+            bail!(
+                "REPORT_DATA mismatch!\n  expected: {}\n  got:      {}",
+                hex::encode(expected_rd),
+                hex::encode(actual_rd)
+            );
+        }
+        let tdx = verify_tdx_quote(&raw).context("Intel TDX DCAP verification failed")?;
+        if verbose {
+            eprintln!("  REPORT_DATA[:32] ✓  {}", hex::encode(actual_rd));
+            eprintln!("  Intel TDX DCAP quote ✓  (AK + QE report + PCK chain → Intel SGX Root CA)");
+            eprintln!("  MRTD:  {}", tdx.mrtd);
+            for (i, r) in tdx.rtmrs.iter().enumerate() {
+                eprintln!("  RTMR{}: {}", i, r);
+            }
+        }
+        tee_summary = "Intel TDX attestation verified ✓".to_string();
+    } else if let Some(report_hex) = attest.report.as_deref() {
+        // AMD SEV-SNP.
+        let raw = hex::decode(report_hex)
+            .into_diagnostic()
+            .context("decoding SNP report hex")?;
+        if raw.len() < SNP_SIGNATURE_OFFSET + 144 {
+            bail!("SNP report too short: {} bytes", raw.len());
+        }
+        let report = SnpReport(&raw);
+        let actual_rd = &report.report_data()[..32];
+        if actual_rd != expected_rd.as_slice() {
+            bail!(
+                "REPORT_DATA mismatch!\n  expected: {}\n  got:      {}",
+                hex::encode(expected_rd),
+                hex::encode(actual_rd)
+            );
+        }
+        if verbose {
+            eprintln!("  REPORT_DATA[:32] ✓  {}", hex::encode(actual_rd));
+        }
+        // VCEK chain. AMD KDS unavailability is tolerated; invalid crypto is not.
+        tee_summary = match verify_vcek_chain(&client, &raw) {
+            Ok(result) => {
+                if verbose {
+                    eprintln!("  AMD {} VCEK chain ✓", result.product);
+                    eprintln!("  MEASUREMENT: {}", result.measurement);
+                }
+                "TEE attestation verified ✓".to_string()
+            }
+            Err(VcekVerifyError::Unavailable(e)) => {
+                if verbose {
+                    eprintln!("  VCEK chain skipped: {}", e);
+                }
+                "content hash verified ✓  (VCEK chain skipped — kds.amd.com unreachable)".to_string()
+            }
+            Err(VcekVerifyError::Invalid(e)) => return Err(e),
+        };
+    } else {
+        bail!("attestation JSON has neither 'quote' (Intel TDX) nor 'report' (AMD SNP)");
     }
-
-    // 6. VCEK chain. AMD KDS unavailability is tolerated; invalid crypto is not.
-    let vcek_verified = match verify_vcek_chain(&client, &raw) {
-        Ok(result) => {
-            if verbose {
-                eprintln!("  AMD {} VCEK chain ✓", result.product);
-                eprintln!("  MEASUREMENT: {}", result.measurement);
-            }
-            true
-        }
-        Err(VcekVerifyError::Unavailable(e)) => {
-            if verbose {
-                eprintln!("  VCEK chain skipped: {}", e);
-            }
-            false
-        }
-        Err(VcekVerifyError::Invalid(e)) => return Err(e),
-    };
 
     if verbose {
         eprintln!("  network:  {}", manifest.network);
@@ -611,11 +848,7 @@ pub fn run(
         .context("extracting tarball")?;
     let _ = std::fs::remove_file(&tar_tmp);
 
-    if vcek_verified {
-        println!("TEE attestation verified ✓");
-    } else {
-        println!("content hash verified ✓  (VCEK chain skipped — kds.amd.com unreachable)");
-    }
+    println!("{}", tee_summary);
 
     Ok(())
 }
