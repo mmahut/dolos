@@ -663,34 +663,61 @@ fn download_parallel(
         let url = url.to_string();
         let dest = dest.to_path_buf();
         handles.push(std::thread::spawn(move || -> miette::Result<()> {
-            let mut resp = client
-                .get(&url)
-                .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
-                .send()
-                .into_diagnostic()
-                .context("range GET")?
-                .error_for_status()
-                .into_diagnostic()
-                .context("range GET status")?;
+            // Resilient per-chunk download: on any connection/stream error or a
+            // premature EOF, resume the range from the current offset. A 175 GB
+            // transfer over a CDN will hit occasional HTTP/2 stream drops.
+            const MAX_RETRIES: u32 = 40;
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&dest)
                 .into_diagnostic()
                 .context("opening temp for positioned write")?;
             let mut off = start;
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = resp
-                    .read(&mut buf)
-                    .into_diagnostic()
-                    .context("reading range body")?;
-                if n == 0 {
+            let mut attempt = 0u32;
+            while off <= end {
+                let res: miette::Result<()> = (|| {
+                    let mut resp = client
+                        .get(&url)
+                        .header(reqwest::header::RANGE, format!("bytes={}-{}", off, end))
+                        .send()
+                        .into_diagnostic()
+                        .context("range GET")?
+                        .error_for_status()
+                        .into_diagnostic()
+                        .context("range GET status")?;
+                    let mut buf = vec![0u8; 1 << 20];
+                    loop {
+                        let n = resp
+                            .read(&mut buf)
+                            .into_diagnostic()
+                            .context("reading range body")?;
+                        if n == 0 {
+                            return Ok(()); // stream ended (maybe early) — checked below
+                        }
+                        f.write_all_at(&buf[..n], off)
+                            .into_diagnostic()
+                            .context("positioned write")?;
+                        off += n as u64;
+                        if off > end {
+                            return Ok(());
+                        }
+                    }
+                })();
+                if res.is_ok() && off > end {
                     break;
                 }
-                f.write_all_at(&buf[..n], off)
-                    .into_diagnostic()
-                    .context("positioned write")?;
-                off += n as u64;
+                // error, or clean EOF before the range end → retry from `off`
+                attempt += 1;
+                if attempt > MAX_RETRIES {
+                    return res.and(Err(miette::miette!(
+                        "range {}-{} stalled at {} after {} retries",
+                        start,
+                        end,
+                        off,
+                        MAX_RETRIES
+                    )));
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
             }
             Ok(())
         }));
