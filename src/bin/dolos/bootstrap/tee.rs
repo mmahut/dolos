@@ -621,6 +621,87 @@ mod tests {
     }
 }
 
+// Number of parallel connections for the snapshot download. R2 throttles per
+// connection (~10 MB/s) but not per bucket, so N streams give ~N× throughput.
+const DL_CONNS: u64 = 16;
+
+// Parallel range download: split the object into DL_CONNS chunks, one blocking
+// GET per thread with a Range header, positioned writes (pwrite) into the
+// preallocated file. Needs a server that supports byte ranges (R2 does).
+fn download_parallel(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+    total: u64,
+    conns: u64,
+) -> miette::Result<()> {
+    use std::io::Read;
+    use std::os::unix::fs::FileExt;
+
+    {
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(dest)
+            .into_diagnostic()
+            .context("creating temp tar file")?;
+        f.set_len(total)
+            .into_diagnostic()
+            .context("preallocating temp tar file")?;
+    }
+
+    let chunk = total.div_ceil(conns);
+    let mut handles = Vec::new();
+    for i in 0..conns {
+        let start = i * chunk;
+        if start >= total {
+            break;
+        }
+        let end = std::cmp::min(start + chunk, total) - 1;
+        let client = client.clone();
+        let url = url.to_string();
+        let dest = dest.to_path_buf();
+        handles.push(std::thread::spawn(move || -> miette::Result<()> {
+            let mut resp = client
+                .get(&url)
+                .header(reqwest::header::RANGE, format!("bytes={}-{}", start, end))
+                .send()
+                .into_diagnostic()
+                .context("range GET")?
+                .error_for_status()
+                .into_diagnostic()
+                .context("range GET status")?;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&dest)
+                .into_diagnostic()
+                .context("opening temp for positioned write")?;
+            let mut off = start;
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = resp
+                    .read(&mut buf)
+                    .into_diagnostic()
+                    .context("reading range body")?;
+                if n == 0 {
+                    break;
+                }
+                f.write_all_at(&buf[..n], off)
+                    .into_diagnostic()
+                    .context("positioned write")?;
+                off += n as u64;
+            }
+            Ok(())
+        }));
+    }
+    for h in handles {
+        h.join()
+            .map_err(|_| miette::miette!("download thread panicked"))??;
+    }
+    Ok(())
+}
+
 pub fn run(
     config: &RootConfig,
     _args: &Args,
@@ -670,22 +751,10 @@ pub fn run(
         );
     }
 
-    // 3. download tarball once to a temp file. Verification and extraction both use this file.
+    // 3. download tarball to a temp file, in parallel (R2 is per-connection
+    // throttled). Falls back to single-stream if the server doesn't report a
+    // size or support byte ranges.
     let tar_url = format!("{}/{}/{}", base, network, snap);
-    eprintln!("downloading {} …", snap);
-
-    let response = client
-        .get(&tar_url)
-        .send()
-        .into_diagnostic()
-        .context("downloading tarball")?
-        .error_for_status()
-        .into_diagnostic()
-        .context("tarball download error")?;
-
-    let total = response.content_length().unwrap_or(0);
-    let progress = feedback.bytes_progress_bar();
-    progress.set_length(total);
 
     let tar_tmp = std::env::temp_dir().join(format!(
         "dolos-disco-{}-{}.tar.gz",
@@ -697,18 +766,51 @@ pub fn run(
             .as_nanos()
     ));
 
-    let mut tar_tmp_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tar_tmp)
+    let head = client
+        .head(&tar_url)
+        .send()
         .into_diagnostic()
-        .context("creating temp tar file")?;
+        .context("HEAD tarball")?
+        .error_for_status()
+        .into_diagnostic()
+        .context("HEAD tarball status")?;
+    let total = head.content_length().unwrap_or(0);
+    let ranges_ok = head
+        .headers()
+        .get(reqwest::header::ACCEPT_RANGES)
+        .map(|v| v.as_bytes() == b"bytes")
+        .unwrap_or(false);
 
-    let mut reader = crate::feedback::ProgressReader::new(response, progress);
-    std::io::copy(&mut reader, &mut tar_tmp_file)
-        .into_diagnostic()
-        .context("writing temp tar file")?;
-    drop(tar_tmp_file);
+    if total > 0 && ranges_ok {
+        eprintln!(
+            "downloading {} ({} bytes) with {} parallel connections …",
+            snap, total, DL_CONNS
+        );
+        download_parallel(&client, &tar_url, &tar_tmp, total, DL_CONNS)?;
+    } else {
+        eprintln!("downloading {} (single stream) …", snap);
+        let response = client
+            .get(&tar_url)
+            .send()
+            .into_diagnostic()
+            .context("downloading tarball")?
+            .error_for_status()
+            .into_diagnostic()
+            .context("tarball download error")?;
+        let progress = feedback.bytes_progress_bar();
+        progress.set_length(response.content_length().unwrap_or(0));
+        let mut tar_tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tar_tmp)
+            .into_diagnostic()
+            .context("creating temp tar file")?;
+        let mut reader = crate::feedback::ProgressReader::new(response, progress);
+        std::io::copy(&mut reader, &mut tar_tmp_file)
+            .into_diagnostic()
+            .context("writing temp tar file")?;
+        drop(tar_tmp_file);
+    }
 
     // 4. verify content hash from the exact tarball that will be unpacked.
     eprintln!("verifying content hash …");
