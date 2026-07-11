@@ -125,14 +125,28 @@ fn compute_content_hash(tar_path: &Path) -> miette::Result<(String, String, Stri
             .to_string_lossy()
             .to_string();
 
+        // Stream into the hashers in bounded chunks — the mainnet archive/index
+        // is multi-GB, so read_to_end would OOM.
         if path.starts_with("archive/") && path.ends_with(".segment") {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).into_diagnostic()?;
-            chain_hasher.update(&buf);
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = entry.read(&mut buf).into_diagnostic()?;
+                if n == 0 {
+                    break;
+                }
+                chain_hasher.update(&buf[..n]);
+            }
         } else if path == "archive/index" {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf).into_diagnostic()?;
-            index_hash = Some(hex::encode(Sha256::digest(&buf)));
+            let mut h = Sha256::new();
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = entry.read(&mut buf).into_diagnostic()?;
+                if n == 0 {
+                    break;
+                }
+                h.update(&buf[..n]);
+            }
+            index_hash = Some(hex::encode(h.finalize()));
         }
     }
 
