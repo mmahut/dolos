@@ -816,6 +816,19 @@ pub fn run(
         .into_diagnostic()
         .context("building HTTP client")?;
 
+    // Dedicated client for the parallel range download. Forced to HTTP/1.1 with
+    // no idle-connection reuse so each of the 16 concurrent range GETs runs on
+    // its OWN TCP connection. Sharing one HTTP/2 connection multiplexes the 16
+    // range streams and (observed against the Cloudflare→R2 edge) returns
+    // corrupt bodies; curl with 16 separate connections is always clean.
+    let dl_client = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .http1_only()
+        .pool_max_idle_per_host(0)
+        .build()
+        .into_diagnostic()
+        .context("building download HTTP client")?;
+
     // 1. resolve latest
     eprintln!("fetching {}/{}/latest.json …", base, network);
     let latest: LatestJson = http_get_json(&client, &format!("{}/{}/latest.json", base, network))?;
@@ -901,7 +914,7 @@ pub fn run(
                 "downloading {} ({} bytes) with {} parallel connections … (attempt {}/{})",
                 snap, total, DL_CONNS, dl_attempt, DL_ATTEMPTS
             );
-            download_parallel(&client, &tar_url, &tar_tmp, total, DL_CONNS)?;
+            download_parallel(&dl_client, &tar_url, &tar_tmp, total, DL_CONNS)?;
         } else {
             eprintln!("downloading {} (single stream) …", snap);
             let response = client
