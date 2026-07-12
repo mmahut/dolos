@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::Path;
 
 use dolos_core::config::RootConfig;
@@ -104,16 +103,34 @@ fn http_get_json<T: for<'de> Deserialize<'de>>(
         .context("parsing JSON response")
 }
 
-// Recompute content_sha256 from the extracted archive directory.
-// content_sha256 = SHA256(chain_sha256 + "  archive/segments\n" + index_sha256 + "  archive/index\n")
-fn compute_content_hash(tar_path: &Path) -> miette::Result<(String, String, String)> {
+// Open a tar decoder for the snapshot, picking zstd or gzip by file extension.
+fn open_tar_decoder(tar_path: &Path) -> miette::Result<Box<dyn std::io::Read>> {
     let file = std::fs::File::open(tar_path)
         .into_diagnostic()
-        .context("opening tarball for content hash")?;
+        .context("opening tarball")?;
+    let name = tar_path.to_string_lossy();
+    if name.ends_with(".zst") || name.ends_with(".zstd") {
+        Ok(Box::new(
+            zstd::stream::read::Decoder::new(file)
+                .into_diagnostic()
+                .context("creating zstd decoder")?,
+        ))
+    } else {
+        Ok(Box::new(GzDecoder::new(file)))
+    }
+}
 
-    let decoder = GzDecoder::new(file);
-    let mut archive = Archive::new(decoder);
+// Single pass: extract the tarball into `root` AND recompute content_sha256 in
+// the same decompression — avoids decompressing the (175 GB) snapshot twice.
+// Returns (content_sha256, chain_sha256, index_sha256), where
+// content_sha256 = SHA256(chain + "  archive/segments\n" + index + "  archive/index\n").
+fn extract_and_hash(tar_path: &Path, root: &Path) -> miette::Result<(String, String, String)> {
+    use std::io::{Read, Write};
+    std::fs::create_dir_all(root)
+        .into_diagnostic()
+        .context("creating storage directory")?;
 
+    let mut archive = Archive::new(open_tar_decoder(tar_path)?);
     let mut chain_hasher = Sha256::new();
     let mut index_hash: Option<String> = None;
 
@@ -124,42 +141,55 @@ fn compute_content_hash(tar_path: &Path) -> miette::Result<(String, String, Stri
             .into_diagnostic()?
             .to_string_lossy()
             .to_string();
+        let is_segment = path.starts_with("archive/") && path.ends_with(".segment");
+        let is_index = path == "archive/index";
 
-        // Stream into the hashers in bounded chunks — the mainnet archive/index
-        // is multi-GB, so read_to_end would OOM.
-        if path.starts_with("archive/") && path.ends_with(".segment") {
+        if is_segment || is_index {
+            // hash while writing to disk (bounded memory — the index is multi-GB)
+            if path.contains("..") || path.starts_with('/') {
+                bail!("unsafe path in tarball: {}", path);
+            }
+            let dest = root.join(&path);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent).into_diagnostic()?;
+            }
+            let mut out = std::fs::File::create(&dest)
+                .into_diagnostic()
+                .context("creating extracted file")?;
+            let mut ih = Sha256::new();
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 let n = entry.read(&mut buf).into_diagnostic()?;
                 if n == 0 {
                     break;
                 }
-                chain_hasher.update(&buf[..n]);
-            }
-        } else if path == "archive/index" {
-            let mut h = Sha256::new();
-            let mut buf = vec![0u8; 1 << 20];
-            loop {
-                let n = entry.read(&mut buf).into_diagnostic()?;
-                if n == 0 {
-                    break;
+                out.write_all(&buf[..n]).into_diagnostic()?;
+                if is_segment {
+                    chain_hasher.update(&buf[..n]);
+                } else {
+                    ih.update(&buf[..n]);
                 }
-                h.update(&buf[..n]);
             }
-            index_hash = Some(hex::encode(h.finalize()));
+            if is_index {
+                index_hash = Some(hex::encode(ih.finalize()));
+            }
+        } else {
+            // everything else (state/, index/, dirs) → normal safe unpack
+            entry
+                .unpack_in(root)
+                .into_diagnostic()
+                .context("extracting entry")?;
         }
     }
 
     let chain_hash = hex::encode(chain_hasher.finalize());
     let index_hash =
         index_hash.ok_or_else(|| miette::miette!("archive/index not found in tarball"))?;
-
     let combined = format!(
         "{}  archive/segments\n{}  archive/index\n",
         chain_hash, index_hash
     );
     let content_hash = hex::encode(Sha256::digest(combined.as_bytes()));
-
     Ok((content_hash, chain_hash, index_hash))
 }
 
@@ -750,7 +780,9 @@ pub fn run(
     verbose: bool,
 ) -> miette::Result<()> {
     let network = network_name(config);
-    let base = DISCO_BASE;
+    // Override with DISCO_BASE env (e.g. a direct-R2 origin that bypasses a CDN).
+    let base_owned = std::env::var("DISCO_BASE").unwrap_or_else(|_| DISCO_BASE.to_string());
+    let base = base_owned.trim_end_matches('/');
     let root = &config.storage.path;
 
     let client = reqwest::blocking::Client::builder()
@@ -797,14 +829,20 @@ pub fn run(
     // size or support byte ranges.
     let tar_url = format!("{}/{}/{}", base, network, snap);
 
+    let tar_ext = if snap.ends_with(".zst") || snap.ends_with(".zstd") {
+        "tar.zst"
+    } else {
+        "tar.gz"
+    };
     let tar_tmp = std::env::temp_dir().join(format!(
-        "dolos-disco-{}-{}.tar.gz",
+        "dolos-disco-{}-{}.{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .into_diagnostic()
             .context("reading system time")?
-            .as_nanos()
+            .as_nanos(),
+        tar_ext
     ));
 
     let head = client
@@ -853,50 +891,17 @@ pub fn run(
         drop(tar_tmp_file);
     }
 
-    // 4. verify content hash from the exact tarball that will be unpacked.
-    eprintln!("verifying content hash …");
-
-    let (content_hash, chain_hash, index_hash) = compute_content_hash(&tar_tmp)?;
-
-    if content_hash != manifest.snapshot.content_sha256 {
-        bail!(
-            "content hash mismatch!\n  expected: {}\n  got:      {}",
-            manifest.snapshot.content_sha256,
-            content_hash
-        );
-    }
-
-    if chain_hash != manifest.snapshot.chain_sha256 {
-        bail!(
-            "chain hash mismatch!\n  expected: {}\n  got:      {}",
-            manifest.snapshot.chain_sha256,
-            chain_hash
-        );
-    }
-
-    if index_hash != manifest.snapshot.index_sha256 {
-        bail!(
-            "index hash mismatch!\n  expected: {}\n  got:      {}",
-            manifest.snapshot.index_sha256,
-            index_hash
-        );
-    }
-
-    if verbose {
-        eprintln!("  content_sha256  ✓  {}", content_hash);
-        eprintln!("  chain_sha256    ✓  {}", chain_hash);
-        eprintln!("  index_sha256    ✓  {}", index_hash);
-    }
-
-    // 5. verify TEE attestation. Dispatch on format: Intel TDX quote (dstack /
+    // 4. verify TEE attestation. Dispatch on format: Intel TDX quote (dstack /
     // Phala) or AMD SEV-SNP report. Both bind REPORT_DATA[:32] = SHA256(content).
+    // We verify against the manifest's content_sha256 here; step 5 then confirms
+    // the downloaded content actually hashes to that value.
     eprintln!("verifying TEE attestation …");
     let attest_bytes = http_get_bytes(&client, &attest_url)?;
     let attest: AttestationJson = serde_json::from_slice(&attest_bytes)
         .into_diagnostic()
         .context("parsing attestation JSON")?;
 
-    let expected_rd = Sha256::digest(content_hash.as_bytes());
+    let expected_rd = Sha256::digest(manifest.snapshot.content_sha256.as_bytes());
     let tee_summary: String;
 
     if let Some(quote_hex) = attest.quote.as_deref() {
@@ -967,29 +972,45 @@ pub fn run(
         bail!("attestation JSON has neither 'quote' (Intel TDX) nor 'report' (AMD SNP)");
     }
 
+    // 5. single pass: extract into storage AND recompute content_sha256 in the
+    // same decompression, then confirm it matches the attested manifest hashes.
+    eprintln!("extracting + verifying content hash (single pass) …");
+    let (content_hash, chain_hash, index_hash) = match extract_and_hash(&tar_tmp, root) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tar_tmp);
+            return Err(e);
+        }
+    };
+    let _ = std::fs::remove_file(&tar_tmp);
+
+    let mismatch = if content_hash != manifest.snapshot.content_sha256 {
+        Some(("content", &manifest.snapshot.content_sha256, &content_hash))
+    } else if chain_hash != manifest.snapshot.chain_sha256 {
+        Some(("chain", &manifest.snapshot.chain_sha256, &chain_hash))
+    } else if index_hash != manifest.snapshot.index_sha256 {
+        Some(("index", &manifest.snapshot.index_sha256, &index_hash))
+    } else {
+        None
+    };
+    if let Some((what, exp, got)) = mismatch {
+        let _ = std::fs::remove_dir_all(root);
+        bail!(
+            "{} hash mismatch — extracted store deleted!\n  expected: {}\n  got:      {}",
+            what,
+            exp,
+            got
+        );
+    }
+
     if verbose {
+        eprintln!("  content_sha256  ✓  {}", content_hash);
+        eprintln!("  chain_sha256    ✓  {}", chain_hash);
+        eprintln!("  index_sha256    ✓  {}", index_hash);
         eprintln!("  network:  {}", manifest.network);
         eprintln!("  epoch:    {}", manifest.epoch);
         eprintln!("  peer:     {}", manifest.peer);
     }
-
-    // 7. Only write verified snapshot contents into storage.
-    eprintln!("extracting verified snapshot …");
-    std::fs::create_dir_all(root)
-        .into_diagnostic()
-        .context("creating storage directory")?;
-
-    let file = std::fs::File::open(&tar_tmp)
-        .into_diagnostic()
-        .context("opening verified tarball")?;
-    let tar_gz = GzDecoder::new(file);
-    let mut archive = Archive::new(tar_gz);
-
-    archive
-        .unpack(root)
-        .into_diagnostic()
-        .context("extracting tarball")?;
-    let _ = std::fs::remove_file(&tar_tmp);
 
     println!("{}", tee_summary);
 

@@ -1466,6 +1466,7 @@ dependencies = [
  "vergen-gitcl",
  "x509-cert",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
