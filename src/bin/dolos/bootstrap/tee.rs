@@ -52,6 +52,10 @@ struct ManifestSnapshot {
     chain_sha256: String,
     #[allow(dead_code)]
     index_sha256: String,
+    /// SHA256 of the compressed tarball itself (transport-integrity checksum,
+    /// not part of the attested content hash). Optional for older manifests.
+    #[serde(default)]
+    tar_sha256: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +105,27 @@ fn http_get_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&bytes)
         .into_diagnostic()
         .context("parsing JSON response")
+}
+
+// Streaming SHA256 of a file (constant memory — the tarball is ~100 GB).
+fn hash_file(path: &Path) -> miette::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .into_diagnostic()
+        .context("opening file for hashing")?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .into_diagnostic()
+            .context("reading file for hashing")?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 // Open a tar decoder for the snapshot, picking zstd or gzip by file extension.
@@ -860,35 +885,73 @@ pub fn run(
         .map(|v| v.as_bytes() == b"bytes")
         .unwrap_or(false);
 
-    if total > 0 && ranges_ok {
-        eprintln!(
-            "downloading {} ({} bytes) with {} parallel connections …",
-            snap, total, DL_CONNS
-        );
-        download_parallel(&client, &tar_url, &tar_tmp, total, DL_CONNS)?;
-    } else {
-        eprintln!("downloading {} (single stream) …", snap);
-        let response = client
-            .get(&tar_url)
-            .send()
-            .into_diagnostic()
-            .context("downloading tarball")?
-            .error_for_status()
-            .into_diagnostic()
-            .context("tarball download error")?;
-        let progress = feedback.bytes_progress_bar();
-        progress.set_length(response.content_length().unwrap_or(0));
-        let mut tar_tmp_file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tar_tmp)
-            .into_diagnostic()
-            .context("creating temp tar file")?;
-        let mut reader = crate::feedback::ProgressReader::new(response, progress);
-        std::io::copy(&mut reader, &mut tar_tmp_file)
-            .into_diagnostic()
-            .context("writing temp tar file")?;
-        drop(tar_tmp_file);
+    // Download with a post-download integrity check against the manifest's
+    // tar_sha256 (the hash of the compressed tarball). A corrupt parallel
+    // download is caught here — before the ~25 min extract — and retried. The
+    // security boundary is still content_sha256 + attestation (verified in
+    // step 5); this is only a transport-integrity guard so we never extract a
+    // mangled archive.
+    const DL_ATTEMPTS: u32 = 3;
+    let mut dl_attempt = 0u32;
+    loop {
+        dl_attempt += 1;
+        let _ = std::fs::remove_file(&tar_tmp);
+        if total > 0 && ranges_ok {
+            eprintln!(
+                "downloading {} ({} bytes) with {} parallel connections … (attempt {}/{})",
+                snap, total, DL_CONNS, dl_attempt, DL_ATTEMPTS
+            );
+            download_parallel(&client, &tar_url, &tar_tmp, total, DL_CONNS)?;
+        } else {
+            eprintln!("downloading {} (single stream) …", snap);
+            let response = client
+                .get(&tar_url)
+                .send()
+                .into_diagnostic()
+                .context("downloading tarball")?
+                .error_for_status()
+                .into_diagnostic()
+                .context("tarball download error")?;
+            let progress = feedback.bytes_progress_bar();
+            progress.set_length(response.content_length().unwrap_or(0));
+            let mut tar_tmp_file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tar_tmp)
+                .into_diagnostic()
+                .context("creating temp tar file")?;
+            let mut reader = crate::feedback::ProgressReader::new(response, progress);
+            std::io::copy(&mut reader, &mut tar_tmp_file)
+                .into_diagnostic()
+                .context("writing temp tar file")?;
+            drop(tar_tmp_file);
+        }
+
+        match manifest.snapshot.tar_sha256.as_deref() {
+            Some(expected) => {
+                eprintln!("verifying downloaded tarball integrity …");
+                let got = hash_file(&tar_tmp)?;
+                if got == expected {
+                    if verbose {
+                        eprintln!("  tar_sha256 ✓  {}", got);
+                    }
+                    break;
+                }
+                eprintln!(
+                    "  tarball hash mismatch (attempt {}/{}):\n    expected: {}\n    got:      {}",
+                    dl_attempt, DL_ATTEMPTS, expected, got
+                );
+                if dl_attempt >= DL_ATTEMPTS {
+                    let _ = std::fs::remove_file(&tar_tmp);
+                    bail!(
+                        "downloaded tarball corrupt after {} attempts (tar_sha256 mismatch)",
+                        DL_ATTEMPTS
+                    );
+                }
+                // otherwise loop and re-download
+            }
+            None => break, // no tar_sha256 in manifest → extract still verifies content
+        }
     }
 
     // 4. verify TEE attestation. Dispatch on format: Intel TDX quote (dstack /
