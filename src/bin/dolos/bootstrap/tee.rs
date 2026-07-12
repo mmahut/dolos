@@ -697,13 +697,7 @@ const DL_CONNS: u64 = 16;
 // Parallel range download: split the object into DL_CONNS chunks, one blocking
 // GET per thread with a Range header, positioned writes (pwrite) into the
 // preallocated file. Needs a server that supports byte ranges (R2 does).
-fn download_parallel(
-    client: &reqwest::blocking::Client,
-    url: &str,
-    dest: &Path,
-    total: u64,
-    conns: u64,
-) -> miette::Result<()> {
+fn download_parallel(url: &str, dest: &Path, total: u64, conns: u64) -> miette::Result<()> {
     use std::io::Read;
     use std::os::unix::fs::FileExt;
 
@@ -728,14 +722,22 @@ fn download_parallel(
             break;
         }
         let end = std::cmp::min(start + chunk, total) - 1;
-        let client = client.clone();
         let url = url.to_string();
         let dest = dest.to_path_buf();
         handles.push(std::thread::spawn(move || -> miette::Result<()> {
             // Resilient per-chunk download: on any connection/stream error or a
-            // premature EOF, resume the range from the current offset. A 175 GB
-            // transfer over a CDN will hit occasional HTTP/2 stream drops.
+            // premature EOF, resume the range from the current offset. A 100 GB
+            // transfer over a CDN will hit occasional stream drops.
             const MAX_RETRIES: u32 = 40;
+            // Each thread gets its OWN client (own connection, no pooling) so the
+            // 16 range GETs are fully independent — a shared client intermittently
+            // returned corrupt bodies against the Cloudflare->R2 edge.
+            let client = reqwest::blocking::Client::builder()
+                .redirect(reqwest::redirect::Policy::limited(10))
+                .pool_max_idle_per_host(0)
+                .build()
+                .into_diagnostic()
+                .context("building per-thread download client")?;
             let f = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&dest)
@@ -750,10 +752,28 @@ fn download_parallel(
                         .header(reqwest::header::RANGE, format!("bytes={}-{}", off, end))
                         .send()
                         .into_diagnostic()
-                        .context("range GET")?
-                        .error_for_status()
-                        .into_diagnostic()
-                        .context("range GET status")?;
+                        .context("range GET")?;
+                    // Must be 206 Partial Content for exactly THIS range. A 200
+                    // (full body) or a shifted/cached range would silently fill
+                    // this chunk with the wrong bytes — the root cause of the
+                    // intermittent corruption. Reject anything else → retry.
+                    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+                        bail!(
+                            "range {}-{}: expected 206, got {}",
+                            off,
+                            end,
+                            resp.status()
+                        );
+                    }
+                    let cr = resp
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    if !cr.starts_with(&format!("bytes {}-", off)) {
+                        bail!("range {}-{}: content-range mismatch '{}'", off, end, cr);
+                    }
                     let mut buf = vec![0u8; 1 << 20];
                     loop {
                         let n = resp
@@ -763,10 +783,13 @@ fn download_parallel(
                         if n == 0 {
                             return Ok(()); // stream ended (maybe early) — checked below
                         }
-                        f.write_all_at(&buf[..n], off)
+                        // Never write past this chunk's end, even if the server
+                        // sends more than requested.
+                        let w = std::cmp::min(n as u64, end - off + 1) as usize;
+                        f.write_all_at(&buf[..w], off)
                             .into_diagnostic()
                             .context("positioned write")?;
-                        off += n as u64;
+                        off += w as u64;
                         if off > end {
                             return Ok(());
                         }
@@ -815,19 +838,6 @@ pub fn run(
         .build()
         .into_diagnostic()
         .context("building HTTP client")?;
-
-    // Dedicated client for the parallel range download. Forced to HTTP/1.1 with
-    // no idle-connection reuse so each of the 16 concurrent range GETs runs on
-    // its OWN TCP connection. Sharing one HTTP/2 connection multiplexes the 16
-    // range streams and (observed against the Cloudflare→R2 edge) returns
-    // corrupt bodies; curl with 16 separate connections is always clean.
-    let dl_client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .http1_only()
-        .pool_max_idle_per_host(0)
-        .build()
-        .into_diagnostic()
-        .context("building download HTTP client")?;
 
     // 1. resolve latest
     eprintln!("fetching {}/{}/latest.json …", base, network);
@@ -914,7 +924,7 @@ pub fn run(
                 "downloading {} ({} bytes) with {} parallel connections … (attempt {}/{})",
                 snap, total, DL_CONNS, dl_attempt, DL_ATTEMPTS
             );
-            download_parallel(&dl_client, &tar_url, &tar_tmp, total, DL_CONNS)?;
+            download_parallel(&tar_url, &tar_tmp, total, DL_CONNS)?;
         } else {
             eprintln!("downloading {} (single stream) …", snap);
             let response = client
